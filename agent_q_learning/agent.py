@@ -20,9 +20,10 @@ from kaiwu_agent.utils.common_func import create_cls, attached
 from kaiwu_agent.agent.base_agent import BaseAgent
 from agent_q_learning.conf.conf import Config
 from agent_q_learning.algorithm.algorithm import Algorithm
+from agent_q_learning.feature.definition import ObsData
 
 
-ObsData = create_cls("ObsData", feature=None)
+#ObsData = create_cls("ObsData", feature=None)
 ActData = create_cls("ActData", act=None)
 
 
@@ -40,6 +41,7 @@ class Agent(BaseAgent):
         self.epsilon = Config.EPSILON
         self.episodes = Config.EPISODES
         self.algorithm = Algorithm(self.gamma, self.learning_rate, self.state_size, self.action_size)
+        self.current_target_id = None
 
         super().__init__(agent_type, device, logger, monitor)
 
@@ -97,70 +99,49 @@ class Agent(BaseAgent):
         return self.algorithm.learn(list_sample_data)
 
     def observation_process(self, raw_obs, game_info):
-        pos = [game_info.pos_x, game_info.pos_z]
-        # Feature #1: Current state of the agent (1-dimensional representation)
-        # 特征#1: 智能体当前 state (1维表示)
-        state = [int(pos[0] * 64 + pos[1])]
-        # Feature #2: One-hot encoding of the agent's current position
-        # 特征#2: 智能体当前位置信息的 one-hot 编码
-        pos_row = [0] * 64
-        pos_row[pos[0]] = 1
-        pos_col = [0] * 64
-        pos_col[pos[1]] = 1
+        # 1. 基础信息：当前坐标
+        pos_x, pos_z = game_info.pos_x, game_info.pos_z
+        pos_id = int(pos_x * 64 + pos_z)
+        
+        # 2. 宝箱状态：0表示已消失，1表示存在
+        treasure_status = [int(x if x != 2 else 0) for x in game_info.treasure_status]
+        
+        # 3. 距离信息：raw_obs[0]是到终点距离，raw_obs[1:11]是到10个固定点的距离
+        dist_to_end = raw_obs[0]
+        dist_to_fixed_points = raw_obs[1:11]
 
-        # Feature #3: Discretized distance of the agent's current position from the endpoint
-        # 特征#3: 智能体当前位置相对于终点的距离(离散化)
-        # Feature #4: Discretized distance of the agent's current position from the treasure
-        # 特征#4: 智能体当前位置相对于宝箱的距离(离散化)
-        end_treasure_dists = raw_obs
+        # 4. 确定当前目标固定点索引 (target_id)
+        # 如果当前没有目标，或者原目标宝箱已经消失，则重新寻找最近的宝箱
+        if self.current_target_id is None or self.current_target_id == 0 or treasure_status[self.current_target_id - 1] == 0:
+            new_target = 0 # 默认去终点
+            min_dist = 999.0
+            for i in range(10):
+                if treasure_status[i] == 1:
+                    if dist_to_fixed_points[i] < min_dist:
+                        min_dist = dist_to_fixed_points[i]
+                        new_target = i + 1
+            self.current_target_id = new_target
 
-        # Feature #5: Graph features generation (obstacle information, treasure information, endpoint information)
-        # 特征#5: 图特征生成(障碍物信息, 宝箱信息, 终点信息)
+        # 5. 组合 State (去耦合设计)
+        # 空间大小：4096 * 11 = 45056
+        # 这个状态只取决于：我在哪 + 我现在要去哪个固定点
+        state = pos_id * 11 + self.current_target_id
+
+        # 提取局部视野用于奖励计算中的碰撞检测
         local_view = [game_info.local_view[i : i + 5] for i in range(0, len(game_info.local_view), 5)]
-        obstacle_map, treasure_map, end_map = [], [], []
+        obstacle_flat = []
         for sub_list in local_view:
-            obstacle_map.append([1 if i == 0 else 0 for i in sub_list])
-            treasure_map.append([1 if i == 4 else 0 for i in sub_list])
-            end_map.append([1 if i == 3 else 0 for i in sub_list])
+            obstacle_flat.extend([1 if i == 0 else 0 for i in sub_list])
 
-        # Feature #6: Conversion of graph features into vector features
-        # 特征#6: 图特征转换为向量特征
-        obstacle_flat, treasure_flat, end_flat = [], [], []
-        for i in obstacle_map:
-            obstacle_flat.extend(i)
-        for i in treasure_map:
-            treasure_flat.extend(i)
-        for i in end_map:
-            end_flat.extend(i)
-
-        # Feature #7: Information of the map areas visited within the agent's current local view
-        # 特征#7: 智能体当前局部视野中的走过的地图信息
-        memory_flat = []
-        for i in range(game_info.view * 2 + 1):
-            idx_start = (pos[0] - game_info.view + i) * 64 + (pos[1] - game_info.view)
-            memory_flat.extend(game_info.location_memory[idx_start : (idx_start + game_info.view * 2 + 1)])
-
-        tmp_treasure_status = [x if x != 2 else 0 for x in game_info.treasure_status]
-
-        raw_obs = np.concatenate(
-            [
-                state,
-                pos_row,
-                pos_col,
-                end_treasure_dists,
-                obstacle_flat,
-                treasure_flat,
-                end_flat,
-                memory_flat,
-                tmp_treasure_status,
-            ]
+        return ObsData(
+            feature=int(state),
+            raw_obs=raw_obs,
+            target_id=self.current_target_id, # 传给奖励函数
+            pos=[pos_x, pos_z],
+            local_obstacle=obstacle_flat,
+            treasure_status=treasure_status,
+            memory=game_info.location_memory # 用于路径重复惩罚
         )
-
-        pos = int(raw_obs[0])
-        treasure_status = [int(item) for item in raw_obs[-10:]]
-        state = 1024 * pos + sum([treasure_status[i] * (2**i) for i in range(10)])
-
-        return ObsData(feature=int(state))
 
     def action_process(self, act_data):
         return act_data.act

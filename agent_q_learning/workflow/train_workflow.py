@@ -19,12 +19,13 @@ from agent_q_learning.feature.definition import (
 import os
 from tools.train_env_conf_validate import check_usr_conf, read_usr_conf
 from tools.metrics_utils import get_training_metrics
+from agent_q_learning.conf.conf import Config
 
 
 @attached
 def workflow(envs, agents, logger=None, monitor=None):
     env, agent = envs[0], agents[0]
-    EPISODES = 10000
+    EPISODES = Config.EPISODES
 
     # Initializing monitoring data
     # 监控数据初始化
@@ -36,6 +37,7 @@ def workflow(envs, agents, logger=None, monitor=None):
         "diy_4": 0,
         "diy_5": 0,
     }
+
     last_report_monitor_time = time.time()
 
     logger.info("Start Training ...")
@@ -61,6 +63,10 @@ def workflow(envs, agents, logger=None, monitor=None):
         logger.error("check_usr_conf return False, please check")
         return
 
+    episode_rewards = []
+    episode_steps = []
+    agent.epsilon = Config.EPSILON_START
+
     for episode in range(EPISODES):
         # Retrieving training metrics
         # 获取训练中的指标
@@ -71,6 +77,8 @@ def workflow(envs, agents, logger=None, monitor=None):
         # Reset the environment and obtain the initial state
         # 重置环境, 并获取初始状态
         obs, state = env.reset(usr_conf=usr_conf)
+
+        agent.current_target_id = None
 
         # Disaster recovery
         # 容灾
@@ -83,11 +91,14 @@ def workflow(envs, agents, logger=None, monitor=None):
 
         # Task loop
         # 任务循环
-        done, agent.epsilon = False, 1.0
+        done = False
+        # 初始化 prev_score 用于计算分数增量
+        prev_score = 0
+        steps_in_episode = 0
         while not done:
             # Agent performs inference to obtain the predicted action for the next frame
             # Agent 进行推理, 获取下一帧的预测动作
-            agent.epsilon = max(0.1, agent.epsilon * math.exp(-(1 / EPISODES) * episode))
+            # agent.epsilon = max(0.1, agent.epsilon * math.exp(-(1 / EPISODES) * episode))
             act_data, model_version = agent.predict(list_obs_data=[obs_data])
             act_data = act_data[0]
 
@@ -107,7 +118,7 @@ def workflow(envs, agents, logger=None, monitor=None):
 
             # Compute reward
             # 计算 reward
-            reward = reward_shaping(frame_no, score, terminated, truncated, obs, _obs)
+            reward, is_urgent = reward_shaping(frame_no, terminated, truncated, obs_data, _obs_data, score, prev_score, steps_in_episode, act)
 
             # Determine over and update the win count
             # 判断结束, 并更新胜利次数
@@ -136,17 +147,39 @@ def workflow(envs, agents, logger=None, monitor=None):
             # 更新总奖励和状态
             total_rew += reward
             obs_data = _obs_data
+            prev_score = score
+            steps_in_episode += 1
+
+            # 在每一步的最后，对 agent.epsilon 进行衰减
+            if agent.epsilon > Config.EPSILON_END:
+                agent.epsilon *= Config.EPSILON_DECAY
+
+        episode_steps.append(steps_in_episode)
+        episode_rewards.append(total_rew)
 
         # Reporting training progress
         # 上报训练进度
         now = time.time()
         if now - last_report_monitor_time > 60:
-            logger.info(f"Episode: {episode + 1}, Reward: {total_rew}")
-            logger.info(f"Training Win Rate: {win_cnt / (episode + 1)}")
+            slice_size = min(len(episode_rewards), 50)
+            avg_reward = sum(episode_rewards[-slice_size:]) / slice_size if slice_size > 0 else 0
+            avg_steps = sum(episode_steps[-slice_size:]) / slice_size if slice_size > 0 else 0
+            win_rate = win_cnt / (episode + 1) if episode + 1 > 0 else 0
+            logger.info(f"Episode: {episode + 1}, Epsilon: {agent.epsilon:.4f}, Avg Reward: {avg_reward:.2f}, Avg Steps: {avg_steps:.1f}, Win Rate: {win_rate:.4f}, Is Urgent: {is_urgent}")
+            #logger.info(f"Episode: {episode + 1}, Reward: {total_rew}")
+            #logger.info(f"Training Win Rate: {win_cnt / (episode + 1)}")
             monitor_data["reward"] = total_rew
+            monitor_data["diy_1"] = agent.epsilon
+            monitor_data["diy_2"] = win_rate
+            monitor_data["diy_3"] = avg_reward
+            monitor_data["diy_4"] = avg_steps
+            monitor_data["diy_5"] = 1 if is_urgent else 0
             if monitor:
                 monitor.put_data({os.getpid(): monitor_data})
 
+            episode_rewards.clear()
+            episode_steps.clear()
+            
             total_rew = 0
             last_report_monitor_time = now
 
@@ -155,6 +188,11 @@ def workflow(envs, agents, logger=None, monitor=None):
         if win_cnt / (episode + 1) > 0.9 and episode > 100:
             logger.info(f"Training Converged at Episode: {episode + 1}")
             monitor_data["reward"] = total_rew
+            monitor_data["diy_1"] = agent.epsilon
+            monitor_data["diy_2"] = win_rate
+            monitor_data["diy_3"] = avg_reward
+            monitor_data["diy_4"] = avg_steps
+            monitor_data["diy_5"] = 1 if is_urgent else 0
             if monitor:
                 monitor.put_data({os.getpid(): monitor_data})
             break
